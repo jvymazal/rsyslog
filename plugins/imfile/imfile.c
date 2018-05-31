@@ -63,6 +63,8 @@
 #include "ruleset.h"
 #include "ratelimit.h"
 #include "parserif.h"
+#include "hashtable.h"
+#include "hashtable_itr.h"
 
 #include <regex.h>
 
@@ -167,6 +169,7 @@ struct act_obj_s {
 	int nRecords; /**< How many records did we process before persisting the stream? */
 	ratelimit_t *ratelimiter;
 	multi_submit_t multiSub;
+	int is_symlink;
 };
 struct fs_edge_s {
 	fs_node_t *parent;
@@ -483,14 +486,14 @@ in_setupWatch(act_obj_t *const act, const int is_file)
 		goto done;
 
 	wd = inotify_add_watch(ino_fd, act->name,
-		(is_file) ? IN_MODIFY : IN_CREATE|IN_DELETE|IN_MOVED_FROM|IN_MOVED_TO);
-	if(wd < 0) {
-		LogError(errno, RS_RET_IO_ERROR, "imfile: cannot watch object '%s'",
-			act->name);
+		(is_file) ? IN_MODIFY|IN_DONT_FOLLOW : IN_CREATE|IN_DELETE|IN_MOVED_FROM|IN_MOVED_TO);
+	if(wd < 0) { /* There is high probability of selinux denial on top-level paths */
+		LogMsg(errno, RS_RET_IO_ERROR, (errno == EACCES)? LOG_NOTICE: LOG_ERR,
+			   "imfile: cannot watch object '%s'", act->name);
 		goto done;
 	}
 	wdmapAdd(wd, act);
-	DBGPRINTF("in_setupDirWatch: watch %d added for dir %s(%p)\n", wd, act->name, act);
+	DBGPRINTF("in_setupWatch: watch %d added for %s(object %p)\n", wd, act->name, act);
 done:	return wd;
 }
 
@@ -542,6 +545,42 @@ finalize_it:
 }
 
 #endif // #ifdef HAVE_INOTIFY_INIT
+
+static struct hashtable *slink_target;     /* hashtable for symlink to target */
+/*
+ * input:  file - including full path
+ * output: target - if not NULL, allocated target name in full path will be returned.
+ * return value: is_symlink: 1 - path is a symlink
+ *                           0 - path is not a symlink
+ *                          -1 - failed to get the info
+ *                          RS_RET_OUT_OF_MEMORY - out of memory
+ */
+static int
+isSymlink(char *file, char **target)
+{
+	int is_symlink = 0;
+	char *result = NULL;
+	result = realpath(file, result);
+	if (NULL == result) {
+		LogError(errno, RS_RET_ERR, "imfile: isSymlink: realpath on %s failed", file);
+		return -1;
+	}
+
+	if(strcmp(file, result)) {
+		DBGPRINTF("imfile: isSymlink: found %s --> %s\n", file, result);
+		is_symlink = 1;
+		if (NULL != target) {
+			*target = strdup(result);
+			if (NULL == *target) {
+				LogError(errno, RS_RET_OUT_OF_MEMORY, "imfile: isSymlink: malloc failed");
+				free(result);
+				return RS_RET_OUT_OF_MEMORY;
+			}
+		}
+	}
+	free(result);
+	return is_symlink;
+}
 
 #if defined(OS_SOLARIS) && defined (HAVE_PORT_SOURCE_FILE)
 static void ATTR_NONNULL()
@@ -605,7 +644,7 @@ done:	return;
 static void ATTR_NONNULL()
 fen_setupWatch(act_obj_t *const act __attribute__((unused)))
 {
-	DBGPRINTF("fen_setupWatch: DUMMY CALLED - not on Solaris?");
+	DBGPRINTF("fen_setupWatch: DUMMY CALLED - not on Solaris?\n");
 }
 #endif /* FEN */
 
@@ -639,7 +678,7 @@ fs_node_print(const fs_node_t *const node, const int level)
  */
 static rsRetVal ATTR_NONNULL()
 act_obj_add(fs_edge_t *const edge, const char *const name, const int is_file,
-	const ino_t ino)
+	const ino_t ino, const int is_symlink)
 {
 	act_obj_t *act;
 	char basename[MAXFNAME];
@@ -660,11 +699,12 @@ act_obj_add(fs_edge_t *const edge, const char *const name, const int is_file,
 	CHKmalloc(act->basename = strdup(basename));
 	act->edge = edge;
 	act->ino = ino;
+	act->is_symlink = is_symlink;
 	#ifdef HAVE_INOTIFY_INIT
 	act->wd = in_setupWatch(act, is_file);
 	#endif
 	fen_setupWatch(act);
-	if(is_file) {
+	if(is_file && !is_symlink) {
 		const instanceConf_t *const inst = edge->instarr[0];// TODO: same file, multiple instances?
 		CHKiRet(ratelimitNew(&act->ratelimiter, "imfile", name));
 		CHKmalloc(act->multiSub.ppMsgs = MALLOC(inst->nMultiSub * sizeof(smsg_t *)));
@@ -746,13 +786,59 @@ poll_active_files(fs_edge_t *const edge)
 	}
 }
 
+static rsRetVal ATTR_NONNULL()
+process_symlink(fs_edge_t *const chld, const char *symlink, char *target, glob_t *glob_result)
+{
+	DEFiRet;
+	char *ptr;
+	char *slink;
+	CHKmalloc(slink = strdup(symlink));
+	ptr = hashtable_search(slink_target, slink);
+	if (NULL != ptr) { /* slink -> something is in the hashtable. */
+		if (strcmp(ptr, target)) { /* something is not target. */
+			act_obj_t *target_act;
+			for(target_act = chld->active ; target_act != NULL ; target_act = target_act->next) {
+				if(!strcmp(target_act->name, ptr)) {
+					act_obj_unlink(target_act);
+					break;
+				}
+			}
+			DBGPRINTF("imfile: process_symlink: removing old target %s of %s\n", ptr, slink);
+			ptr = hashtable_remove(slink_target, slink);
+			free(ptr);
+		} else {
+			free(slink);
+			ABORT_FINALIZE(RS_RET_IDLE);
+		}
+	}
+	DBGPRINTF("imfile: process_symlink: hashtable_insert(slink, %s->%s)\n", slink, target);
+	int rv = 1;
+	/* Note: slink & target are passed in and consumed in the hashtable. */
+	rv = hashtable_insert(slink_target, slink, target);
+	if(rv == 0) { /* out of memory */
+		LogError(errno, RS_RET_OUT_OF_MEMORY, "imfile: process_symlink: hastable_insert failed");
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
+	glob_result->gl_pathv = realloc(glob_result->gl_pathv, (glob_result->gl_pathc+1)*sizeof(char *));
+	if (glob_result->gl_pathv == NULL) {
+		LogError(errno, RS_RET_OUT_OF_MEMORY, "imfile: process_symlink: realloc failed");
+		ABORT_FINALIZE(RS_RET_OUT_OF_STACKSPACE); /* need special retcode to end poll_tree */
+	}
+	char *globtarget;
+	CHKmalloc(globtarget = strdup(target));
+	glob_result->gl_pathv[glob_result->gl_pathc] = globtarget;
+	++glob_result->gl_pathc;
+	DBGPRINTF("imfile: process_symlink: added one more file (%s) to processing loop\n", target);
 
-static void ATTR_NONNULL() poll_tree(fs_edge_t *const chld);
+finalize_it:    RETiRet;
+}
+
 static void ATTR_NONNULL()
 poll_tree(fs_edge_t *const chld)
 {
 	struct stat fileInfo;
 	glob_t files;
+	int issymlink;
 	DBGPRINTF("poll_tree: chld %p, name '%s', path: %s\n", chld, chld->name, chld->path);
 	detect_updates(chld);
 	const int ret = glob((char*)chld->path, runModConf->sortFiles|GLOB_BRACE, NULL, &files);
@@ -770,12 +856,33 @@ poll_tree(fs_edge_t *const chld)
 				continue;
 			}
 
-			const int is_file = S_ISREG(fileInfo.st_mode);
-			DBGPRINTF("poll_tree:  found '%s', File: %d (config file: %d)\n",
-				file, is_file, chld->is_file);
+			char *target = NULL;
+			issymlink = isSymlink(file, &target);
+			if (issymlink == -1) { /* some serious problem with the file - skip */
+				continue;
+			}
+			/* need to add watch for symlink as well in case of target change */
+			const int is_file = (S_ISREG(fileInfo.st_mode) || issymlink);
+			DBGPRINTF("poll_tree:  found '%s', File: %d (config file: %d), symlink: %d\n",
+				file, is_file, chld->is_file, issymlink);
+			if (issymlink > 0) {
+				rsRetVal slink_ret = process_symlink(chld, file, target, &files);
+				if (slink_ret != RS_RET_OK) {
+					free(target);
+					if (slink_ret == RS_RET_OUT_OF_STACKSPACE) {
+						goto done; /* glob result now invalid */
+					}
+					continue;
+				}
+			} else if (RS_RET_OUT_OF_MEMORY == issymlink) {
+				LogError(errno, RS_RET_OUT_OF_MEMORY, "imfile: poll_tree: IsSymlink failed");
+				continue;
+			} else { /* not a symlink */
+				free(target);
+			}
 			if(!is_file && S_ISREG(fileInfo.st_mode)) {
 				LogMsg(0, RS_RET_ERR, LOG_WARNING,
-					"imfile: '%s' is neither a regular file nor a "
+					"imfile: '%s' is neither a regular file, symlink nor a "
 					"directory - ignored", file);
 				continue;
 			}
@@ -786,7 +893,7 @@ poll_tree(fs_edge_t *const chld)
 					(chld->is_file) ? "FILE" : "DIRECTORY");
 				continue;
 			}
-			act_obj_add(chld, file, is_file, fileInfo.st_ino);
+			act_obj_add(chld, file, is_file, fileInfo.st_ino, issymlink);
 		}
 		globfree(&files);
 	}
@@ -826,6 +933,22 @@ act_obj_destroy(act_obj_t *const act, const int is_deleted)
 
 	DBGPRINTF("act_obj_destroy: act %p '%s', wd %d, pStrm %p, is_deleted %d, in_move %d\n",
 		act, act->name, act->wd, act->pStrm, is_deleted, act->in_move);
+	if(act->is_symlink && is_deleted) {
+		char *ptr;
+		/* Check if slink -> target is in the hashtable. */
+		ptr = hashtable_search(slink_target, act->name);
+		if (NULL != ptr) {
+			act_obj_t *target_act;
+			for(target_act = act->edge->active ; target_act != NULL ; target_act = target_act->next) {
+				if(!strcmp(target_act->name, ptr)) {
+					act_obj_unlink(target_act);
+					break;
+				}
+			}
+			ptr = hashtable_remove(slink_target, act->name);
+			free(ptr);
+		}
+	}
 	if(act->ratelimiter != NULL) {
 		ratelimitDestruct(act->ratelimiter);
 	}
@@ -1384,6 +1507,9 @@ pollFile(act_obj_t *const act)
 {
 	cstr_t *pCStr = NULL;
 	DEFiRet;
+	if (act->is_symlink) {
+		RETiRet;    /* no reason to poll symlink file */
+	}
 	/* Note: we must do pthread_cleanup_push() immediately, because the POSIX macros
 	 * otherwise do not work if I include the _cleanup_pop() inside an if... -- rgerhards, 2008-08-14
 	 */
@@ -2052,7 +2178,7 @@ in_processEvent(struct inotify_event *ev)
 	}
 	if(ev->mask & (IN_MOVED_FROM | IN_MOVED_TO))  {
 		fs_node_walk(etry->act->edge->node, poll_tree);
-	} else if(etry->act->edge->is_file) {
+	} else if(etry->act->edge->is_file && !(etry->act->is_symlink)) {
 		in_handleFileEvent(ev, etry); // esentially poll_file()!
 	} else {
 		fs_node_walk(etry->act->edge->node, poll_tree);
@@ -2429,6 +2555,7 @@ CODESTARTmodExit
 	#ifdef HAVE_INOTIFY_INIT
 	free(wdmap);
 	#endif
+	hashtable_destroy(slink_target, 1);
 ENDmodExit
 
 
@@ -2527,4 +2654,6 @@ CODEmodInit_QueryRegCFSLineHdlr
 	  	NULL, &cs.iPollInterval, STD_LOADABLE_MODULE_ID, &bLegacyCnfModGlobalsPermitted));
 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
 		resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+	/* initialize the symlink hashtable */
+	CHKmalloc(slink_target = create_hashtable(1024, hash_from_string, key_equals_string, NULL));
 ENDmodInit

@@ -892,6 +892,7 @@ TESTS += \
 	imfile-old-state-file.sh \
 	imfile-rename-while-stopped.sh \
 	imfile-rename.sh \
+	imfile-symlink.sh \
 	glbl-oversizeMsg-truncate-imfile.sh
 
 if HAVE_VALGRIND
